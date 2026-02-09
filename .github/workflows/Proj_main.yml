@@ -127,13 +127,12 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           
           # Read the ports
-          # SOCKS_PORT=$(cat ../socks_port.txt)
+          SOCKS_PORT=$(cat ../socks_port.txt)
           SSH_PORT=$(cat ../ssh_port.txt)
           
           # Write config file
           FILE_PATH="config/one.txt"
           cat > "$FILE_PATH" <<EOF
-          $SOCKS_PORT
           $SSH_PORT
           EOF
           
