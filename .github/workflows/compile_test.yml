@@ -1,0 +1,71 @@
+name: action_test_commit_24
+
+on:
+  workflow_dispatch:
+  # optional schedule:
+  # schedule:
+  #   - cron: "0 9 * * *"  # daily at 09:00 UTC
+
+permissions:
+  contents: read
+
+jobs:
+  commit:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout public repo (optional)
+        uses: actions/checkout@v4
+
+      - name: Set up SSH for private repo
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.TARGET_REPO_SSH_KEY }}
+
+      - name: Trust github.com host key
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan -t rsa,ecdsa,ed25519 github.com >> ~/.ssh/known_hosts
+
+      - name: Clone private repo (URL is secret)
+        env:
+          TARGET_REPO_SSH: ${{ secrets.TARGET_REPO_SSH }}
+          TARGET_REPO_BRANCH: ${{ secrets.TARGET_REPO_BRANCH }}
+        run: |
+          set -euo pipefail
+          # Make extra sure the secret doesn't show up if anything prints it:
+          echo "::add-mask::$TARGET_REPO_SSH"
+
+          BRANCH="${TARGET_REPO_BRANCH:-main}"
+
+          git clone --depth 1 --branch "$BRANCH" "$TARGET_REPO_SSH" private-repo
+
+      - name: Overwrite file + commit + push
+        env:
+          TARGET_REPO_BRANCH: ${{ secrets.TARGET_REPO_BRANCH }}
+        run: |
+          set -euo pipefail
+          BRANCH="${TARGET_REPO_BRANCH:-main}"
+
+          cd private-repo
+
+          # Configure a bot identity for the commit
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # !!! EDIT THIS PATH to your .txt file inside the private repo
+          FILE_PATH="config/one.txt"
+
+          # Overwrite file content exactly
+          printf "GitHub action commit\n" > "$FILE_PATH"
+
+          git add "$FILE_PATH"
+
+          # If nothing changed, don't create noise
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+
+          git commit -m "Update txt via GitHub Action"
+          git push origin "$BRANCH"
