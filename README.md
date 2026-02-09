@@ -1,10 +1,5 @@
-Here is the updated README with the emojis removed and the project name changed to **Fundix**.
-
----
-
 # Fundix
 
-[https://github.com/raricki/fundix.git](https://github.com/raricki/fundix.git)
 
 A robust, multi-threaded, terminal-based chat room application built with Python. This project features a full client-server architecture where multiple clients can connect to a central server, authenticate (Sign Up/Login), and exchange messages in a unified public chat room in real-time.
 
