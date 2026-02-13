@@ -171,4 +171,4 @@ The SQLite database `chat_users.db` contains a single table `users`:
 
 ## License
 
-This project is open-source and free to use for educational purposes. Feel free to modify and expand upon it!
+This project is open-source and free to use for educational purposes. Feel free to modify and expand upon it!.
