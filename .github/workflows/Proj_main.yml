@@ -138,7 +138,7 @@ jobs:
           BRANCH="${TARGET_REPO_BRANCH:-main}"
           
           # Wait for 1 hour (3600 seconds)
-          DURATION_SECONDS=3600
+          DURATION_SECONDS=60
           END_TIME=$(($(date +%s) + DURATION_SECONDS))
           
           COUNTER=0
