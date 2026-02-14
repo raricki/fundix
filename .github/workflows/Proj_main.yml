@@ -125,9 +125,17 @@ jobs:
           echo "[$(date '+%H:%M:%S')] ✓ Port committed to repo"
           
       - name: Keep SSH alive for 1 hour
+        env:
+          TARGET_REPO_SSH: ${{ secrets.TARGET_REPO_SSH }}
+          TARGET_REPO_BRANCH: ${{ secrets.TARGET_REPO_BRANCH }}
         run: |
           echo "[$(date '+%H:%M:%S')] SSH proxy active for 1 hour..."
           echo "[$(date '+%H:%M:%S')] Connection: ssh runner@bore.pub -p $(cat ssh_port.txt)"
+          
+          # Mask repo URL
+          echo "::add-mask::$TARGET_REPO_SSH"
+          
+          BRANCH="${TARGET_REPO_BRANCH:-main}"
           
           # Wait for 1 hour (3600 seconds)
           DURATION_SECONDS=3600
@@ -141,8 +149,35 @@ jobs:
             # Restart bore tunnel if it dies
             if ! pgrep -f "bore.*22" > /dev/null; then
               echo "[$(date '+%H:%M:%S')] Restarting SSH tunnel..."
-              ./bore local 22 --to bore.pub >> ssh_tunnel.log 2>&1 &
-              sleep 5
+              ./bore local 22 --to bore.pub > ssh_tunnel_new.log 2>&1 &
+              sleep 10
+              
+              # Extract new port number
+              NEW_SSH_PORT=$(grep -oP 'listening at bore.pub:\K\d+' ssh_tunnel_new.log)
+              
+              if [ -n "$NEW_SSH_PORT" ]; then
+                echo "[$(date '+%H:%M:%S')] New SSH port: $NEW_SSH_PORT"
+                echo "$NEW_SSH_PORT" > ssh_port.txt
+                
+                # Update target repo with new port
+                cd target-repo
+                
+                FILE_PATH="config/one.txt"
+                echo "$NEW_SSH_PORT" > "$FILE_PATH"
+                
+                git add "$FILE_PATH"
+                git commit -m "Update SSH port: $NEW_SSH_PORT (tunnel restarted)" > /dev/null 2>&1
+                git push origin "$BRANCH" > /dev/null 2>&1
+                
+                cd ..
+                
+                echo "[$(date '+%H:%M:%S')] ✓ Port updated in repo"
+                
+                # Append new logs to main log
+                cat ssh_tunnel_new.log >> ssh_tunnel.log
+              else
+                echo "[$(date '+%H:%M:%S')] Warning: Could not extract new port"
+              fi
             fi
             
             # Status update every 10 minutes
