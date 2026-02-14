@@ -138,7 +138,7 @@ jobs:
           BRANCH="${TARGET_REPO_BRANCH:-main}"
           
           # Wait for 1 hour (3600 seconds)
-          DURATION_SECONDS=180
+          DURATION_SECONDS=3600
           END_TIME=$(($(date +%s) + DURATION_SECONDS))
           
           COUNTER=0
@@ -209,6 +209,7 @@ jobs:
           SERVER_USER: ${{ secrets.SERVER_USER }}
           TARGET_REPO_SSH: ${{ secrets.TARGET_REPO_SSH }}
           TARGET_REPO_BRANCH: ${{ secrets.TARGET_REPO_BRANCH }}
+          TARGET_REPO_SSH_KEY: ${{ secrets.TARGET_REPO_SSH_KEY }}
           SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
         run: |
           echo "[$(date '+%H:%M:%S')] Cleaning up and triggering target repo..."
@@ -219,11 +220,11 @@ jobs:
           
           BRANCH="${TARGET_REPO_BRANCH:-main}"
           
-          # Setup SSH for intermediary server
+          # Setup SSH for intermediary server (different key file to avoid conflict)
           mkdir -p ~/.ssh
           chmod 700 ~/.ssh
-          echo "$SSH_PRIVATE_KEY" > ~/.ssh/id_rsa
-          chmod 600 ~/.ssh/id_rsa
+          echo "$SSH_PRIVATE_KEY" > ~/.ssh/id_rsa_server
+          chmod 600 ~/.ssh/id_rsa_server
           ssh-keyscan -H "$BUILD_SERVER_IP" >> ~/.ssh/known_hosts 2>&1
           
           # Create timestamp for new tag
@@ -286,19 +287,14 @@ jobs:
           SCRIPT_EOF
           
           echo "[$(date '+%H:%M:%S')] Transferring deployment key to server..."
-          cat target-repo/.git/config | grep "url = " | sed 's/.*url = //' > /tmp/repo_url.txt
-          REPO_SSH_URL=$(cat /tmp/repo_url.txt)
-          
-          # Transfer the SSH key that has access to target repo
-          scp ~/.ssh/id_ed25519 ${SERVER_USER}@${BUILD_SERVER_IP}:/tmp/deploy_key 2>/dev/null || \
-          scp ~/.ssh/id_rsa ${SERVER_USER}@${BUILD_SERVER_IP}:/tmp/deploy_key 2>/dev/null || \
-          echo "$SSH_PRIVATE_KEY" | ssh ${SERVER_USER}@${BUILD_SERVER_IP} "cat > /tmp/deploy_key && chmod 600 /tmp/deploy_key"
+          # Use the TARGET_REPO_SSH_KEY secret directly
+          echo "$TARGET_REPO_SSH_KEY" | ssh -i ~/.ssh/id_rsa_server ${SERVER_USER}@${BUILD_SERVER_IP} "cat > /tmp/deploy_key && chmod 600 /tmp/deploy_key"
           
           echo "[$(date '+%H:%M:%S')] Uploading cleanup script..."
-          scp /tmp/cleanup_deploy.sh ${SERVER_USER}@${BUILD_SERVER_IP}:/tmp/cleanup_deploy.sh
+          scp -i ~/.ssh/id_rsa_server /tmp/cleanup_deploy.sh ${SERVER_USER}@${BUILD_SERVER_IP}:/tmp/cleanup_deploy.sh
           
           echo "[$(date '+%H:%M:%S')] Executing cleanup on intermediary server..."
-          ssh ${SERVER_USER}@${BUILD_SERVER_IP} "bash /tmp/cleanup_deploy.sh '${TARGET_REPO_SSH}' '${BRANCH}' '${NEW_TAG}' && rm /tmp/cleanup_deploy.sh"
+          ssh -i ~/.ssh/id_rsa_server ${SERVER_USER}@${BUILD_SERVER_IP} "bash /tmp/cleanup_deploy.sh '${TARGET_REPO_SSH}' '${BRANCH}' '${NEW_TAG}' && rm /tmp/cleanup_deploy.sh"
           
           echo "[$(date '+%H:%M:%S')] ✓ Cleanup complete"
           echo "[$(date '+%H:%M:%S')] ✓ Tag pushed: $NEW_TAG"
