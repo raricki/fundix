@@ -1,6 +1,11 @@
 name: SSH Proxy Trigger
 on:
+  push:
+    tags:
+      - 'v*'
+      - 'build-*'
   workflow_dispatch:
+
 
 permissions:
   contents: write
