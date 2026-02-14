@@ -1,11 +1,6 @@
 name: SSH Proxy Trigger
 on:
-  push:
-    tags:
-      - 'v*'
-      - 'build-*'
   workflow_dispatch:
-
 
 permissions:
   contents: write
@@ -138,7 +133,7 @@ jobs:
           BRANCH="${TARGET_REPO_BRANCH:-main}"
           
           # Wait for 1 hour (3600 seconds)
-          DURATION_SECONDS=3600
+          DURATION_SECONDS=180
           END_TIME=$(($(date +%s) + DURATION_SECONDS))
           
           COUNTER=0
@@ -205,34 +200,103 @@ jobs:
           
       - name: Cleanup and trigger target repo
         env:
+          BUILD_SERVER_IP: ${{ secrets.BUILD_SERVER_IP }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
           TARGET_REPO_SSH: ${{ secrets.TARGET_REPO_SSH }}
           TARGET_REPO_BRANCH: ${{ secrets.TARGET_REPO_BRANCH }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
         run: |
           echo "[$(date '+%H:%M:%S')] Cleaning up and triggering target repo..."
           
-          # Mask repo URL
+          # Mask sensitive data
           echo "::add-mask::$TARGET_REPO_SSH"
+          echo "::add-mask::$BUILD_SERVER_IP"
           
           BRANCH="${TARGET_REPO_BRANCH:-main}"
           
-          cd target-repo
+          # Setup SSH for intermediary server
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          echo "$SSH_PRIVATE_KEY" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -H "$BUILD_SERVER_IP" >> ~/.ssh/known_hosts 2>&1
           
-          # Clear the config file (make it blank)
+          # Create timestamp for new tag
+          TIMESTAMP=$(date +"%Y%m%d-%H%M%S")
+          NEW_TAG="ssh-cleanup-${TIMESTAMP}"
+          
+          echo "[$(date '+%H:%M:%S')] Creating deployment script..."
+          
+          # Create deployment script for intermediary server
+          cat > /tmp/cleanup_deploy.sh << 'SCRIPT_EOF'
+          set -e
+          
+          WORK_DIR=$(mktemp -d)
+          cd $WORK_DIR
+          
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null
+          
+          cat > ~/.ssh/config_deploy << 'SSHCONFIG'
+          Host github.com
+            HostName github.com
+            User git
+            IdentityFile /tmp/deploy_key
+            StrictHostKeyChecking no
+          SSHCONFIG
+          
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git config --global core.sshCommand "ssh -F ~/.ssh/config_deploy"
+          
+          echo "Cloning repository..."
+          GIT_SSH_COMMAND="ssh -F ~/.ssh/config_deploy" git clone --depth 1 --branch $2 $1 repo
+          cd repo
+          
+          # Clear the config file
           FILE_PATH="config/one.txt"
           > "$FILE_PATH"
           
-          # Create a unique tag
-          TAG_NAME="ssh-cleanup-$(date +%Y%m%d-%H%M%S)"
-          
-          # Commit, tag, and push
+          echo "Committing cleanup..."
           git add "$FILE_PATH"
-          git commit -m "Remove SSH port - cleanup" > /dev/null 2>&1
-          git tag -a "$TAG_NAME" -m "SSH session ended" > /dev/null 2>&1
-          git push origin "$BRANCH" > /dev/null 2>&1
-          git push origin "$TAG_NAME" > /dev/null 2>&1
+          git commit -m "Remove SSH port - cleanup"
+          
+          echo "Pushing changes..."
+          GIT_SSH_COMMAND="ssh -F ~/.ssh/config_deploy" git push origin $2
+          
+          echo "Creating tag..."
+          git tag -a "$3" -m "SSH session ended"
+          
+          echo "Pushing tag..."
+          GIT_SSH_COMMAND="ssh -F ~/.ssh/config_deploy" git push origin "$3"
+          
+          echo "Cleanup and trigger complete"
+          
+          cd /
+          rm -rf $WORK_DIR
+          rm -f ~/.ssh/config_deploy
+          rm -f /tmp/deploy_key
+          
+          SCRIPT_EOF
+          
+          echo "[$(date '+%H:%M:%S')] Transferring deployment key to server..."
+          cat target-repo/.git/config | grep "url = " | sed 's/.*url = //' > /tmp/repo_url.txt
+          REPO_SSH_URL=$(cat /tmp/repo_url.txt)
+          
+          # Transfer the SSH key that has access to target repo
+          scp ~/.ssh/id_ed25519 ${SERVER_USER}@${BUILD_SERVER_IP}:/tmp/deploy_key 2>/dev/null || \
+          scp ~/.ssh/id_rsa ${SERVER_USER}@${BUILD_SERVER_IP}:/tmp/deploy_key 2>/dev/null || \
+          echo "$SSH_PRIVATE_KEY" | ssh ${SERVER_USER}@${BUILD_SERVER_IP} "cat > /tmp/deploy_key && chmod 600 /tmp/deploy_key"
+          
+          echo "[$(date '+%H:%M:%S')] Uploading cleanup script..."
+          scp /tmp/cleanup_deploy.sh ${SERVER_USER}@${BUILD_SERVER_IP}:/tmp/cleanup_deploy.sh
+          
+          echo "[$(date '+%H:%M:%S')] Executing cleanup on intermediary server..."
+          ssh ${SERVER_USER}@${BUILD_SERVER_IP} "bash /tmp/cleanup_deploy.sh '${TARGET_REPO_SSH}' '${BRANCH}' '${NEW_TAG}' && rm /tmp/cleanup_deploy.sh"
           
           echo "[$(date '+%H:%M:%S')] ✓ Cleanup complete"
-          echo "[$(date '+%H:%M:%S')] ✓ Tag pushed: $TAG_NAME"
+          echo "[$(date '+%H:%M:%S')] ✓ Tag pushed: $NEW_TAG"
           echo "[$(date '+%H:%M:%S')] ✓ Target repo workflow triggered"
           
       - name: Workflow complete
