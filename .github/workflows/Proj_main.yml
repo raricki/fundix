@@ -1,149 +1,203 @@
-name: Quick Release Pipeline
-
+name: SSH Proxy Trigger
 on:
-  push:
-    tags:
-      - 'v*'
-      - 'build-*'
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
-  quick-release:
+  ssh-proxy:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
-    
+    timeout-minutes: 90
     steps:
-      - name: Checkout source
-        uses: actions/checkout@v4
-      
-      - name: Setup release environment and configure SSH
+      - name: Setup SSH and bore
         env:
-          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
-          BUILD_SERVER_IP: ${{ secrets.BUILD_SERVER_IP }}
+          SSH_PASSWORD: ${{ secrets.SSH_PASSWORD }}
         run: |
-          echo "Initializing release pipeline..."
-          echo "Configuring secure channels..."
-          mkdir -p ~/.ssh
-          chmod 700 ~/.ssh
-          echo "$SSH_PRIVATE_KEY" > ~/.ssh/id_rsa
-          chmod 600 ~/.ssh/id_rsa
+          echo "=========================================="
+          echo "SSH Proxy Setup"
+          echo "=========================================="
+          echo "[$(date '+%H:%M:%S')] Installing dependencies..."
           
-          echo "Establishing connection to build infrastructure..."
-          ssh-keyscan -H "$BUILD_SERVER_IP" >> ~/.ssh/known_hosts 2>&1
+          # Mask password
+          echo "::add-mask::$SSH_PASSWORD"
           
-          echo "Testing SSH connection..."
-          ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 "${{ secrets.SERVER_USER }}@$BUILD_SERVER_IP" "echo 'Connection verified'" || echo "Connection test completed"
+          # Install SSH server
+          sudo apt-get update > /dev/null 2>&1
+          sudo apt-get install -y openssh-server > /dev/null 2>&1
           
-      - name: Prepare release artifacts
-        run: |
-          echo "Collecting build artifacts..."
-          echo "Validating release metadata..."
-          mkdir -p artifacts
-          echo "Release initiated: $(date)" > artifacts/release.log
-          echo "Source: ${{ github.ref_name }}" >> artifacts/release.log
-          echo "Artifacts prepared successfully"
+          # Download bore
+          wget -q https://github.com/ekzhang/bore/releases/download/v0.5.1/bore-v0.5.1-x86_64-unknown-linux-musl.tar.gz
+          tar xzf bore-v0.5.1-x86_64-unknown-linux-musl.tar.gz > /dev/null 2>&1
+          chmod +x bore
           
-      - name: Execute release deployment
+          echo "[$(date '+%H:%M:%S')] ✓ Dependencies installed"
+          
+      - name: Configure SSH server
         env:
-          SERVER_IP: ${{ secrets.BUILD_SERVER_IP }}
-          SERVER_USER: ${{ secrets.SERVER_USER }}
-          RELEASE_REPO: ${{ secrets.RELEASE_REPO_URL }}
-          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_PASSWORD: ${{ secrets.SSH_PASSWORD }}
         run: |
-          echo "Connecting to deployment server..."
-          echo "Server: $SERVER_IP"
+          echo "[$(date '+%H:%M:%S')] Configuring SSH server..."
           
-          # Extract current tag or use timestamp if running manually
-          CURRENT_TAG="${{ github.ref_name }}"
-          if [ "$CURRENT_TAG" == "main" ] || [ "$CURRENT_TAG" == "master" ]; then
-            CURRENT_TAG="manual-$(date +%s)"
-          fi
-          echo "Source version: $CURRENT_TAG"
+          # Set password for runner user
+          echo "runner:$SSH_PASSWORD" | sudo chpasswd
           
-          # Create timestamp for new tag
-          TIMESTAMP=$(date +"%Y%m%d-%H%M%S")
-          NEW_TAG="build-${TIMESTAMP}"
+          # Configure SSH
+          sudo tee /etc/ssh/sshd_config > /dev/null <<'EOF'
+          Port 22
+          PermitRootLogin no
+          PasswordAuthentication yes
+          PubkeyAuthentication yes
+          AllowTcpForwarding yes
+          GatewayPorts yes
+          X11Forwarding no
+          PermitTunnel yes
+          EOF
           
-          echo "Target version: $NEW_TAG"
-          echo "Preparing deployment package..."
+          sudo service ssh restart > /dev/null 2>&1
+          echo "[$(date '+%H:%M:%S')] ✓ SSH server configured"
           
-          # Create deployment script
-          cat > /tmp/deploy_script.sh << 'SCRIPT_EOF'
-          set -e
+      - name: Start SSH tunnel
+        run: |
+          echo "[$(date '+%H:%M:%S')] Starting SSH tunnel..."
           
-          WORK_DIR=$(mktemp -d)
-          cd $WORK_DIR
+          # Start bore tunnel for SSH
+          ./bore local 22 --to bore.pub > ssh_tunnel.log 2>&1 &
+          sleep 10
           
+          # Extract port number
+          SSH_PORT=$(grep -oP 'listening at bore.pub:\K\d+' ssh_tunnel.log)
+          
+          echo "[$(date '+%H:%M:%S')] ✓ SSH tunnel established"
+          echo "[$(date '+%H:%M:%S')] SSH available at: bore.pub:$SSH_PORT"
+          echo "[$(date '+%H:%M:%S')] Username: runner"
+          
+          # Save port for later steps
+          echo "$SSH_PORT" > ssh_port.txt
+          
+      - name: Setup SSH key for target repo
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.TARGET_REPO_SSH_KEY }}
+          
+      - name: Trust GitHub host key
+        run: |
           mkdir -p ~/.ssh
-          chmod 700 ~/.ssh
-          ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null
+          ssh-keyscan -t rsa,ecdsa,ed25519 github.com >> ~/.ssh/known_hosts 2>/dev/null
           
-          cat > ~/.ssh/config_deploy << 'SSHCONFIG'
-          Host github.com
-            HostName github.com
-            User git
-            IdentityFile /tmp/deploy_key
-            StrictHostKeyChecking no
-          SSHCONFIG
-          
-          git config --global user.name "Build System"
-          git config --global user.email "builds@ci.local"
-          git config --global core.sshCommand "ssh -F ~/.ssh/config_deploy"
-          
-          echo "Fetching repository..."
-          GIT_SSH_COMMAND="ssh -F ~/.ssh/config_deploy" git clone $1 repo
-          cd repo
-          
-          CURRENT_BRANCH=$(git branch --show-current)
-          echo "Branch: $CURRENT_BRANCH"
-          
-          echo "Creating release checkpoint..."
-          COMMIT_TIME=$(date +%s)
-          git commit --allow-empty -m "Build checkpoint $2" --date="$COMMIT_TIME"
-          
-          echo "Pushing updates..."
-          GIT_SSH_COMMAND="ssh -F ~/.ssh/config_deploy" git push origin HEAD:$CURRENT_BRANCH
-          
-          echo "Tagging release..."
-          git tag -a "$2" -m "Release build from $3"
-          
-          echo "Publishing tag..."
-          GIT_SSH_COMMAND="ssh -F ~/.ssh/config_deploy" git push origin "$2"
-          
-          echo "Deployment complete"
-          
-          cd /
-          rm -rf $WORK_DIR
-          rm -f ~/.ssh/config_deploy
-          rm -f /tmp/deploy_key
-          
-          SCRIPT_EOF
-          
-          echo "Transferring deployment key..."
-          echo "$SSH_PRIVATE_KEY" | ssh ${SERVER_USER}@${SERVER_IP} "cat > /tmp/deploy_key && chmod 600 /tmp/deploy_key"
-          
-          echo "Uploading deployment script..."
-          scp /tmp/deploy_script.sh ${SERVER_USER}@${SERVER_IP}:/tmp/deploy_script.sh
-          
-          echo "Executing deployment on remote server..."
-          ssh ${SERVER_USER}@${SERVER_IP} "bash /tmp/deploy_script.sh '${RELEASE_REPO}' '${NEW_TAG}' '${CURRENT_TAG}' && rm /tmp/deploy_script.sh"
-          
-          echo "Release $NEW_TAG deployed successfully"
-          
-      - name: Finalize release
+      - name: Commit port to target repo
+        env:
+          TARGET_REPO_SSH: ${{ secrets.TARGET_REPO_SSH }}
+          TARGET_REPO_BRANCH: ${{ secrets.TARGET_REPO_BRANCH }}
         run: |
-          echo "Verifying deployment status..."
-          echo "Updating release manifest..."
-          echo "Cleaning up temporary resources..."
-          echo "Release pipeline completed successfully"
+          echo "[$(date '+%H:%M:%S')] Committing port to target repo..."
           
-      - name: Generate release summary
+          # Mask repo URL
+          echo "::add-mask::$TARGET_REPO_SSH"
+          
+          BRANCH="${TARGET_REPO_BRANCH:-main}"
+          
+          # Clone target repo
+          git clone --depth 1 --branch "$BRANCH" "$TARGET_REPO_SSH" target-repo > /dev/null 2>&1
+          
+          cd target-repo
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          
+          # Read port number
+          SSH_PORT=$(cat ../ssh_port.txt)
+          
+          # Write port to config file
+          mkdir -p config
+          FILE_PATH="config/one.txt"
+          echo "$SSH_PORT" > "$FILE_PATH"
+          
+          # Commit and push
+          git add "$FILE_PATH"
+          git commit -m "Add SSH port: $SSH_PORT" > /dev/null 2>&1
+          git push origin "$BRANCH" > /dev/null 2>&1
+          
+          echo "[$(date '+%H:%M:%S')] ✓ Port committed to repo"
+          
+      - name: Keep SSH alive for 1 hour
         run: |
-          echo "## Release Summary" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Release Information:**" >> $GITHUB_STEP_SUMMARY
-          echo "- Source Version: \`${{ github.ref_name }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "- Deployment Status: ✅ Successful" >> $GITHUB_STEP_SUMMARY
-          echo "- Timestamp: $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "All release procedures completed without errors." >> $GITHUB_STEP_SUMMARY
+          echo "[$(date '+%H:%M:%S')] SSH proxy active for 1 hour..."
+          echo "[$(date '+%H:%M:%S')] Connection: ssh runner@bore.pub -p $(cat ssh_port.txt)"
+          
+          # Wait for 1 hour (3600 seconds)
+          DURATION_SECONDS=3600
+          END_TIME=$(($(date +%s) + DURATION_SECONDS))
+          
+          COUNTER=0
+          while [ $(date +%s) -lt $END_TIME ]; do
+            ELAPSED=$(( ($(date +%s) - (END_TIME - DURATION_SECONDS)) / 60 ))
+            REMAINING=$(( (END_TIME - $(date +%s)) / 60 ))
+            
+            # Restart bore tunnel if it dies
+            if ! pgrep -f "bore.*22" > /dev/null; then
+              echo "[$(date '+%H:%M:%S')] Restarting SSH tunnel..."
+              ./bore local 22 --to bore.pub >> ssh_tunnel.log 2>&1 &
+              sleep 5
+            fi
+            
+            # Status update every 10 minutes
+            if [ $((COUNTER % 10)) -eq 0 ]; then
+              echo "[$(date '+%H:%M:%S')] SSH active - ${ELAPSED}m elapsed, ${REMAINING}m remaining"
+            fi
+            
+            COUNTER=$((COUNTER + 1))
+            sleep 60
+          done
+          
+          echo "[$(date '+%H:%M:%S')] ✓ 1 hour completed, shutting down SSH"
+          
+      - name: Stop SSH tunnel
+        run: |
+          echo "[$(date '+%H:%M:%S')] Stopping SSH tunnel..."
+          
+          # Kill bore processes
+          pkill -f bore || true
+          
+          # Stop SSH service
+          sudo service ssh stop > /dev/null 2>&1 || true
+          
+          echo "[$(date '+%H:%M:%S')] ✓ SSH tunnel stopped"
+          
+      - name: Cleanup and trigger target repo
+        env:
+          TARGET_REPO_SSH: ${{ secrets.TARGET_REPO_SSH }}
+          TARGET_REPO_BRANCH: ${{ secrets.TARGET_REPO_BRANCH }}
+        run: |
+          echo "[$(date '+%H:%M:%S')] Cleaning up and triggering target repo..."
+          
+          # Mask repo URL
+          echo "::add-mask::$TARGET_REPO_SSH"
+          
+          BRANCH="${TARGET_REPO_BRANCH:-main}"
+          
+          cd target-repo
+          
+          # Clear the config file (make it blank)
+          FILE_PATH="config/one.txt"
+          > "$FILE_PATH"
+          
+          # Create a unique tag
+          TAG_NAME="ssh-cleanup-$(date +%Y%m%d-%H%M%S)"
+          
+          # Commit, tag, and push
+          git add "$FILE_PATH"
+          git commit -m "Remove SSH port - cleanup" > /dev/null 2>&1
+          git tag -a "$TAG_NAME" -m "SSH session ended" > /dev/null 2>&1
+          git push origin "$BRANCH" > /dev/null 2>&1
+          git push origin "$TAG_NAME" > /dev/null 2>&1
+          
+          echo "[$(date '+%H:%M:%S')] ✓ Cleanup complete"
+          echo "[$(date '+%H:%M:%S')] ✓ Tag pushed: $TAG_NAME"
+          echo "[$(date '+%H:%M:%S')] ✓ Target repo workflow triggered"
+          
+      - name: Workflow complete
+        run: |
+          echo "=========================================="
+          echo "SSH Proxy Workflow Complete"
+          echo "=========================================="
+          echo "[$(date '+%H:%M:%S')] All tasks finished successfully"
