@@ -122,7 +122,7 @@ jobs:
           
           echo "[$(date '+%H:%M:%S')] ✓ Port committed to repo"
           
-      - name: Keep SSH alive for 5 hour
+      - name: Keep SSH alive for 1 hour
         env:
           TARGET_REPO_SSH: ${{ secrets.TARGET_REPO_SSH }}
           TARGET_REPO_BRANCH: ${{ secrets.TARGET_REPO_BRANCH }}
@@ -135,8 +135,8 @@ jobs:
           
           BRANCH="${TARGET_REPO_BRANCH:-main}"
           
-          # Wait for 5 hour (18000 seconds)
-          DURATION_SECONDS=18000
+          # Wait for 1 hour (3600 seconds)
+          DURATION_SECONDS=3600
           END_TIME=$(($(date +%s) + DURATION_SECONDS))
           
           COUNTER=0
