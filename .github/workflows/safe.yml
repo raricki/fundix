@@ -122,12 +122,12 @@ jobs:
           
           echo "[$(date '+%H:%M:%S')] ✓ Port committed to repo"
           
-      - name: Keep SSH alive for 1 hour
+      - name: Keep SSH alive for 5 hour
         env:
           TARGET_REPO_SSH: ${{ secrets.TARGET_REPO_SSH }}
           TARGET_REPO_BRANCH: ${{ secrets.TARGET_REPO_BRANCH }}
         run: |
-          echo "[$(date '+%H:%M:%S')] SSH proxy active for 1 hour..."
+          echo "[$(date '+%H:%M:%S')] SSH proxy active for 5 hour..."
           echo "[$(date '+%H:%M:%S')] Connection: ssh runner@bore.pub -p $(cat ssh_port.txt)"
           
           # Mask repo URL
@@ -135,8 +135,8 @@ jobs:
           
           BRANCH="${TARGET_REPO_BRANCH:-main}"
           
-          # Wait for 1 hour (3600 seconds)
-          DURATION_SECONDS=3600
+          # Wait for 5 hour (18000 seconds)
+          DURATION_SECONDS=18000
           END_TIME=$(($(date +%s) + DURATION_SECONDS))
           
           COUNTER=0
