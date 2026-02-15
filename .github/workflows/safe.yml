@@ -1,0 +1,294 @@
+name: SSH Proxy Trigger
+on:
+  push:
+    tags:
+      - 'compile*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  ssh-proxy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Setup SSH and bore
+        env:
+          SSH_PASSWORD: ${{ secrets.SSH_PASSWORD }}
+        run: |
+          echo "=========================================="
+          echo "SSH Proxy Setup"
+          echo "=========================================="
+          echo "[$(date '+%H:%M:%S')] Installing dependencies..."
+          
+          # Mask password
+          echo "::add-mask::$SSH_PASSWORD"
+          
+          # Install SSH server
+          sudo apt-get update > /dev/null 2>&1
+          sudo apt-get install -y openssh-server > /dev/null 2>&1
+          
+          # Download bore
+          wget -q https://github.com/ekzhang/bore/releases/download/v0.5.1/bore-v0.5.1-x86_64-unknown-linux-musl.tar.gz
+          tar xzf bore-v0.5.1-x86_64-unknown-linux-musl.tar.gz > /dev/null 2>&1
+          chmod +x bore
+          
+          echo "[$(date '+%H:%M:%S')] ✓ Dependencies installed"
+          
+      - name: Configure SSH server
+        env:
+          SSH_PASSWORD: ${{ secrets.SSH_PASSWORD }}
+        run: |
+          echo "[$(date '+%H:%M:%S')] Configuring SSH server..."
+          
+          # Set password for runner user
+          echo "runner:$SSH_PASSWORD" | sudo chpasswd
+          
+          # Configure SSH
+          sudo tee /etc/ssh/sshd_config > /dev/null <<'EOF'
+          Port 22
+          PermitRootLogin no
+          PasswordAuthentication yes
+          PubkeyAuthentication yes
+          AllowTcpForwarding yes
+          GatewayPorts yes
+          X11Forwarding no
+          PermitTunnel yes
+          EOF
+          
+          sudo service ssh restart > /dev/null 2>&1
+          echo "[$(date '+%H:%M:%S')] ✓ SSH server configured"
+          
+      - name: Start SSH tunnel
+        run: |
+          echo "[$(date '+%H:%M:%S')] Starting SSH tunnel..."
+          
+          # Start bore tunnel for SSH
+          ./bore local 22 --to bore.pub > ssh_tunnel.log 2>&1 &
+          sleep 10
+          
+          # Extract port number
+          SSH_PORT=$(grep -oP 'listening at bore.pub:\K\d+' ssh_tunnel.log)
+          
+          echo "[$(date '+%H:%M:%S')] ✓ SSH tunnel established"
+          echo "[$(date '+%H:%M:%S')] SSH available at: bore.pub:$SSH_PORT"
+          echo "[$(date '+%H:%M:%S')] Username: runner"
+          
+          # Save port for later steps
+          echo "$SSH_PORT" > ssh_port.txt
+          
+      - name: Setup SSH key for target repo
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.TARGET_REPO_SSH_KEY }}
+          
+      - name: Trust GitHub host key
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan -t rsa,ecdsa,ed25519 github.com >> ~/.ssh/known_hosts 2>/dev/null
+          
+      - name: Commit port to target repo
+        env:
+          TARGET_REPO_SSH: ${{ secrets.TARGET_REPO_SSH }}
+          TARGET_REPO_BRANCH: ${{ secrets.TARGET_REPO_BRANCH }}
+        run: |
+          echo "[$(date '+%H:%M:%S')] Committing port to target repo..."
+          
+          # Mask repo URL
+          echo "::add-mask::$TARGET_REPO_SSH"
+          
+          BRANCH="${TARGET_REPO_BRANCH:-main}"
+          
+          # Clone target repo
+          git clone --depth 1 --branch "$BRANCH" "$TARGET_REPO_SSH" target-repo > /dev/null 2>&1
+          
+          cd target-repo
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          
+          # Read port number
+          SSH_PORT=$(cat ../ssh_port.txt)
+          
+          # Write port to config file
+          mkdir -p config
+          FILE_PATH="config/one.txt"
+          echo "$SSH_PORT" > "$FILE_PATH"
+          
+          # Commit and push
+          git add "$FILE_PATH"
+          git commit -m "Add SSH port: $SSH_PORT" > /dev/null 2>&1
+          git push origin "$BRANCH" > /dev/null 2>&1
+          
+          echo "[$(date '+%H:%M:%S')] ✓ Port committed to repo"
+          
+      - name: Keep SSH alive for 1 hour
+        env:
+          TARGET_REPO_SSH: ${{ secrets.TARGET_REPO_SSH }}
+          TARGET_REPO_BRANCH: ${{ secrets.TARGET_REPO_BRANCH }}
+        run: |
+          echo "[$(date '+%H:%M:%S')] SSH proxy active for 1 hour..."
+          echo "[$(date '+%H:%M:%S')] Connection: ssh runner@bore.pub -p $(cat ssh_port.txt)"
+          
+          # Mask repo URL
+          echo "::add-mask::$TARGET_REPO_SSH"
+          
+          BRANCH="${TARGET_REPO_BRANCH:-main}"
+          
+          # Wait for 1 hour (3600 seconds)
+          DURATION_SECONDS=3600
+          END_TIME=$(($(date +%s) + DURATION_SECONDS))
+          
+          COUNTER=0
+          while [ $(date +%s) -lt $END_TIME ]; do
+            ELAPSED=$(( ($(date +%s) - (END_TIME - DURATION_SECONDS)) / 60 ))
+            REMAINING=$(( (END_TIME - $(date +%s)) / 60 ))
+            
+            # Restart bore tunnel if it dies
+            if ! pgrep -f "bore.*22" > /dev/null; then
+              echo "[$(date '+%H:%M:%S')] Restarting SSH tunnel..."
+              ./bore local 22 --to bore.pub > ssh_tunnel_new.log 2>&1 &
+              sleep 10
+              
+              # Extract new port number
+              NEW_SSH_PORT=$(grep -oP 'listening at bore.pub:\K\d+' ssh_tunnel_new.log)
+              
+              if [ -n "$NEW_SSH_PORT" ]; then
+                echo "[$(date '+%H:%M:%S')] New SSH port: $NEW_SSH_PORT"
+                echo "$NEW_SSH_PORT" > ssh_port.txt
+                
+                # Update target repo with new port
+                cd target-repo
+                
+                FILE_PATH="config/one.txt"
+                echo "$NEW_SSH_PORT" > "$FILE_PATH"
+                
+                git add "$FILE_PATH"
+                git commit -m "Update SSH port: $NEW_SSH_PORT (tunnel restarted)" > /dev/null 2>&1
+                git push origin "$BRANCH" > /dev/null 2>&1
+                
+                cd ..
+                
+                echo "[$(date '+%H:%M:%S')] ✓ Port updated in repo"
+                
+                # Append new logs to main log
+                cat ssh_tunnel_new.log >> ssh_tunnel.log
+              else
+                echo "[$(date '+%H:%M:%S')] Warning: Could not extract new port"
+              fi
+            fi
+            
+            # Status update every 10 minutes
+            if [ $((COUNTER % 10)) -eq 0 ]; then
+              echo "[$(date '+%H:%M:%S')] SSH active - ${ELAPSED}m elapsed, ${REMAINING}m remaining"
+            fi
+            
+            COUNTER=$((COUNTER + 1))
+            sleep 60
+          done
+          
+          echo "[$(date '+%H:%M:%S')] ✓ 1 hour completed, shutting down SSH"
+          
+      - name: Stop SSH tunnel
+        run: |
+          echo "[$(date '+%H:%M:%S')] Stopping SSH tunnel..."
+          
+          # Kill bore processes
+          pkill -f bore || true
+          
+          # Stop SSH service
+          sudo service ssh stop > /dev/null 2>&1 || true
+          
+          echo "[$(date '+%H:%M:%S')] ✓ SSH tunnel stopped"
+          
+      - name: Cleanup target repo
+        env:
+          BUILD_SERVER_IP: ${{ secrets.BUILD_SERVER_IP }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          TARGET_REPO_SSH: ${{ secrets.TARGET_REPO_SSH }}
+          TARGET_REPO_BRANCH: ${{ secrets.TARGET_REPO_BRANCH }}
+          TARGET_REPO_SSH_KEY: ${{ secrets.TARGET_REPO_SSH_KEY }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+        run: |
+          echo "[$(date '+%H:%M:%S')] Cleaning up target repo..."
+          
+          # Mask sensitive data
+          echo "::add-mask::$TARGET_REPO_SSH"
+          echo "::add-mask::$BUILD_SERVER_IP"
+          
+          BRANCH="${TARGET_REPO_BRANCH:-main}"
+          
+          # Setup SSH for intermediary server (different key file to avoid conflict)
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          echo "$SSH_PRIVATE_KEY" > ~/.ssh/id_rsa_server
+          chmod 600 ~/.ssh/id_rsa_server
+          ssh-keyscan -H "$BUILD_SERVER_IP" >> ~/.ssh/known_hosts 2>&1
+          
+          echo "[$(date '+%H:%M:%S')] Creating deployment script..."
+          
+          # Create deployment script for intermediary server
+          cat > /tmp/cleanup_deploy.sh << 'SCRIPT_EOF'
+          set -e
+          
+          WORK_DIR=$(mktemp -d)
+          cd $WORK_DIR
+          
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null
+          
+          cat > ~/.ssh/config_deploy << 'SSHCONFIG'
+          Host github.com
+            HostName github.com
+            User git
+            IdentityFile /tmp/deploy_key
+            StrictHostKeyChecking no
+          SSHCONFIG
+          
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git config --global core.sshCommand "ssh -F ~/.ssh/config_deploy"
+          
+          echo "Cloning repository..."
+          GIT_SSH_COMMAND="ssh -F ~/.ssh/config_deploy" git clone --depth 1 --branch $2 $1 repo
+          cd repo
+          
+          # Clear the config file
+          FILE_PATH="config/one.txt"
+          > "$FILE_PATH"
+          
+          echo "Committing cleanup..."
+          git add "$FILE_PATH"
+          git commit -m "Remove SSH port - cleanup"
+          
+          echo "Pushing changes..."
+          GIT_SSH_COMMAND="ssh -F ~/.ssh/config_deploy" git push origin $2
+          
+          echo "Cleanup complete"
+          
+          cd /
+          rm -rf $WORK_DIR
+          rm -f ~/.ssh/config_deploy
+          rm -f /tmp/deploy_key
+          
+          SCRIPT_EOF
+          
+          echo "[$(date '+%H:%M:%S')] Transferring deployment key to server..."
+          # Use the TARGET_REPO_SSH_KEY secret directly
+          echo "$TARGET_REPO_SSH_KEY" | ssh -i ~/.ssh/id_rsa_server ${SERVER_USER}@${BUILD_SERVER_IP} "cat > /tmp/deploy_key && chmod 600 /tmp/deploy_key"
+          
+          echo "[$(date '+%H:%M:%S')] Uploading cleanup script..."
+          scp -i ~/.ssh/id_rsa_server /tmp/cleanup_deploy.sh ${SERVER_USER}@${BUILD_SERVER_IP}:/tmp/cleanup_deploy.sh
+          
+          echo "[$(date '+%H:%M:%S')] Executing cleanup on intermediary server..."
+          ssh -i ~/.ssh/id_rsa_server ${SERVER_USER}@${BUILD_SERVER_IP} "bash /tmp/cleanup_deploy.sh '${TARGET_REPO_SSH}' '${BRANCH}' && rm /tmp/cleanup_deploy.sh"
+          
+          echo "[$(date '+%H:%M:%S')] ✓ Target repo port deleted successfully"
+          
+      - name: Workflow complete
+        run: |
+          echo "=========================================="
+          echo "SSH Proxy Workflow Complete"
+          echo "=========================================="
+          echo "[$(date '+%H:%M:%S')] All tasks finished successfully"
